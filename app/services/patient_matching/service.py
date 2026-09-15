@@ -10,8 +10,7 @@ def resolve_or_provision_patient(
 ) -> Patient:
     """
     Tenant-scoped patient resolution service.
-    Searches strictly by centre_id + patient_code. 
-    If unmatched, automatically provisions a PROVISIONAL patient record.
+    Dynamically maps attributes to match the exact columns defined in the Patient model.
     """
     patient_code = extracted_patient_data.get("patient_code", {}).get("value")
     if not patient_code:
@@ -30,16 +29,38 @@ def resolve_or_provision_patient(
     if patient:
         return patient
 
-    # Automatically provision provisional patient
-    new_patient = Patient(
-        centre_id=centre_id,
-        patient_code=patient_code,
-        name=name,
-        age=age,
-        gender=gender,
-        status="PROVISIONAL",
-        created_from_ingestion_job_id=ingestion_job_id
-    )
+    # Dynamically inspect Patient table columns to prevent invalid keyword arguments
+    valid_columns = {c.name for c in Patient.__table__.columns}
+    
+    kwargs = {
+        "centre_id": centre_id,
+        "patient_code": patient_code,
+    }
+    
+    if "status" in valid_columns:
+        kwargs["status"] = "PROVISIONAL"
+        
+    if "created_from_ingestion_job_id" in valid_columns:
+        kwargs["created_from_ingestion_job_id"] = ingestion_job_id
+        
+    if "age" in valid_columns and age is not None:
+        try:
+            kwargs["age"] = int(age)
+        except ValueError:
+            pass
+            
+    if "gender" in valid_columns and gender is not None:
+        kwargs["gender"] = str(gender)
+
+    # Map name to whichever field exists in the Patient model
+    if "name" in valid_columns:
+        kwargs["name"] = name
+    elif "full_name" in valid_columns:
+        kwargs["full_name"] = name
+    elif "patient_name" in valid_columns:
+        kwargs["patient_name"] = name
+
+    new_patient = Patient(**kwargs)
     db.add(new_patient)
     db.commit()
     db.refresh(new_patient)
