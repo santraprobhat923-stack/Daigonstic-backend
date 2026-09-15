@@ -1,7 +1,32 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, UniqueConstraint, JSON
 from sqlalchemy.orm import relationship
 from datetime import datetime
+import enum
 from app.database import Base
+
+# Enums required by schemas and routers
+class PaymentStatusEnum(str, enum.Enum):
+    PENDING = "PENDING"
+    HELD = "HELD"
+    PAID = "PAID"
+    RELEASED = "RELEASED"
+    REFUNDED = "REFUNDED"
+
+class ReportStatusEnum(str, enum.Enum):
+    PHOTO_UPLOADED = "PHOTO_UPLOADED"
+    NEEDS_VERIFICATION = "NEEDS_VERIFICATION"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+
+class TransactionTypeEnum(str, enum.Enum):
+    CREDIT_PURCHASE = "CREDIT_PURCHASE"
+    REPORT_FEE = "REPORT_FEE"
+    PAYOUT = "PAYOUT"
+
+class PurchaseStatusEnum(str, enum.Enum):
+    INITIATED = "INITIATED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
 
 class Centre(Base):
     __tablename__ = "centres"
@@ -54,5 +79,5 @@ class ReportIngestionJob(Base):
     file_size = Column(Integer, nullable=False)
     source_image_path = Column(String, nullable=False)
     source_image_hash = Column(String, nullable=False)
-    status = Column(String, default="PHOTO_UPLOADED") # PHOTO_UPLOADED, NEEDS_VERIFICATION, VERIFIED, REJECTED
+    status = Column(String, default="PHOTO_UPLOADED")
     created_at = Column(DateTime, default=datetime.utcnow)
