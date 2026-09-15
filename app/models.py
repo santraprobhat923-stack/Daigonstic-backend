@@ -36,6 +36,14 @@ class Patient(Base):
         UniqueConstraint('centre_id', 'patient_code', name='uq_centre_patient_code'),
     )
 
+class PatientSession(Base):
+    __tablename__ = "patient_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
+    token = Column(String, unique=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+
 class ReportIngestionJob(Base):
     __tablename__ = "report_ingestion_jobs"
     id = Column(Integer, primary_key=True, index=True)
