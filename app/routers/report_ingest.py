@@ -7,6 +7,8 @@ import json
 
 from app.database import get_db
 from app.models import ReportIngestionJob, Patient
+from app.oauth2 import require_technician
+from app import schemas
 from app.services.extraction import get_extraction_provider
 from app.services.extraction.base import ExtractionProcessingError
 from app.services.patient_matching.service import resolve_or_provision_patient
@@ -24,52 +26,88 @@ STORAGE_DIR = "storage/source_images"
 def upload_photo(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user=Depends(require_technician),
 ):
-    # STAGING ONLY:
-    # Authentication/tenant context will replace these hardcoded values
-    # in the security phase.
-    centre_id = 9901
-    technician_id = 1
+    centre_id = current_user.centre_id
+    technician_id = current_user.id
 
-    os.makedirs(
-        f"{STORAGE_DIR}/{centre_id}",
-        exist_ok=True,
-    )
-
-    contents = file.file.read()
-
-    if not contents:
+    allowed_mime_types = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type not in allowed_mime_types:
         raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty",
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Only JPEG, PNG, and WebP report images are supported",
         )
 
-    file_size = len(contents)
+    contents = file.file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    # Keep the browser prototype safe from accidental huge uploads.
+    max_size = 15 * 1024 * 1024
+    if len(contents) > max_size:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Image is too large. Maximum allowed size is 15 MB",
+        )
+
     file_hash = hashlib.sha256(contents).hexdigest()
 
-    original_filename = file.filename or "uploaded_image"
+    # SHA-256 is the upload identity. Re-uploading the exact same image should
+    # not create another ingestion job or consume another report credit later.
+    existing_job = (
+        db.query(ReportIngestionJob)
+        .filter(
+            ReportIngestionJob.centre_id == centre_id,
+            ReportIngestionJob.source_image_hash == file_hash,
+        )
+        .order_by(ReportIngestionJob.id.desc())
+        .first()
+    )
+    if existing_job:
+        return {
+            "job_id": existing_job.id,
+            "id": existing_job.id,
+            "status": existing_job.status,
+            "original_filename": existing_job.original_filename,
+            "filename": existing_job.original_filename,
+            "file_size": existing_job.file_size,
+            "file_hash": existing_job.source_image_hash,
+            "duplicate": True,
+            "message": "This image has already been uploaded for this centre",
+        }
 
+    original_filename = os.path.basename(file.filename or "uploaded_image")
     filename = f"{file_hash[:16]}_{original_filename}"
-    save_path = f"{STORAGE_DIR}/{centre_id}/{filename}"
+    centre_dir = os.path.join(STORAGE_DIR, str(centre_id))
+    os.makedirs(centre_dir, exist_ok=True)
+    save_path = os.path.join(centre_dir, filename)
 
     with open(save_path, "wb") as f:
         f.write(contents)
 
-    job = ReportIngestionJob(
-        centre_id=centre_id,
-        technician_id=technician_id,
-        original_filename=original_filename,
-        mime_type=file.content_type or "application/octet-stream",
-        file_size=file_size,
-        source_image_path=save_path,
-        source_image_hash=file_hash,
-        status="PHOTO_UPLOADED",
-        created_at=datetime.utcnow(),
-    )
-
-    db.add(job)
-    db.commit()
-    db.refresh(job)
+    try:
+        job = ReportIngestionJob(
+            centre_id=centre_id,
+            technician_id=technician_id,
+            original_filename=original_filename,
+            mime_type=file.content_type,
+            file_size=len(contents),
+            source_image_path=save_path,
+            source_image_hash=file_hash,
+            status="PHOTO_UPLOADED",
+            created_at=datetime.utcnow(),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+    except Exception:
+        db.rollback()
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
+        raise
 
     return {
         "job_id": job.id,
@@ -79,6 +117,53 @@ def upload_photo(
         "filename": job.original_filename,
         "file_size": job.file_size,
         "file_hash": job.source_image_hash,
+        "duplicate": False,
+    }
+
+
+@router.get("/{job_id}")
+def get_ingestion_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_technician),
+):
+    job = (
+        db.query(ReportIngestionJob)
+        .filter(
+            ReportIngestionJob.id == job_id,
+            ReportIngestionJob.centre_id == current_user.centre_id,
+        )
+        .first()
+    )
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Ingestion job not found")
+
+    def parse_json(value):
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    return {
+        "job_id": job.id,
+        "id": job.id,
+        "status": job.status,
+        "centre_id": job.centre_id,
+        "technician_id": job.technician_id,
+        "patient_id": job.patient_id,
+        "original_filename": job.original_filename,
+        "mime_type": job.mime_type,
+        "file_size": job.file_size,
+        "file_hash": job.source_image_hash,
+        "extracted_data": parse_json(job.extracted_data),
+        "verified_data": parse_json(job.verified_data),
+        "verified_at": job.verified_at,
+        "verified_by": job.verified_by,
+        "final_report_id": job.final_report_id,
+        "last_error": parse_json(job.last_error),
     }
 
 
@@ -86,10 +171,9 @@ def upload_photo(
 def extract_report(
     job_id: int,
     db: Session = Depends(get_db),
+    current_user=Depends(require_technician),
 ):
-    # STAGING ONLY:
-    # Authentication/tenant context will replace this hardcoded value.
-    centre_id = 9901
+    centre_id = current_user.centre_id
 
     job = (
         db.query(ReportIngestionJob)
@@ -107,16 +191,10 @@ def extract_report(
         )
 
     if not job.source_image_path:
-        raise HTTPException(
-            status_code=400,
-            detail="Ingestion job has no source image",
-        )
+        raise HTTPException(status_code=400, detail="Ingestion job has no source image")
 
     if not os.path.exists(job.source_image_path):
-        raise HTTPException(
-            status_code=404,
-            detail="Source image file not found",
-        )
+        raise HTTPException(status_code=404, detail="Source image file not found")
 
     if job.status == "VERIFIED":
         raise HTTPException(
@@ -124,50 +202,30 @@ def extract_report(
             detail="Cannot extract an already verified ingestion job",
         )
 
-    # --------------------------------------------------------
-    # 1. Execute extraction against THIS job's source image.
-    # --------------------------------------------------------
     extractor = get_extraction_provider()
 
     try:
         extraction_result = extractor.extract(
             image_path=job.source_image_path,
-            context={
-                "centre_id": centre_id,
-                "job_id": job.id,
-            },
+            context={"centre_id": centre_id, "job_id": job.id},
         )
     except ExtractionProcessingError as exc:
         job.status = "EXTRACTION_FAILED"
         job.last_error = json.dumps(
-            {
-                "code": exc.code,
-                "message": exc.message,
-            },
+            {"code": exc.code, "message": exc.message},
             ensure_ascii=False,
         )
         job.attempt_count = (job.attempt_count or 0) + 1
         db.commit()
-
         raise HTTPException(
             status_code=422,
-            detail={
-                "code": exc.code,
-                "message": exc.message,
-            },
+            detail={"code": exc.code, "message": exc.message},
         ) from exc
 
     if extraction_result is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Extraction provider returned no result",
-        )
+        raise HTTPException(status_code=500, detail="Extraction provider returned no result")
 
-    # --------------------------------------------------------
-    # 2. Resolve or provision the patient.
-    # --------------------------------------------------------
     patient_payload = extraction_result.patient.model_dump()
-
     patient = resolve_or_provision_patient(
         db=db,
         centre_id=centre_id,
@@ -175,18 +233,11 @@ def extract_report(
         ingestion_job_id=job.id,
     )
 
-    # --------------------------------------------------------
-    # 3. Persist extraction + patient linkage together.
-    #
-    # extracted_data is TEXT in the current SQLite schema,
-    # therefore serialize the provider result explicitly.
-    # --------------------------------------------------------
     job.extracted_data = json.dumps(
         extraction_result.model_dump(),
         ensure_ascii=False,
         separators=(",", ":"),
     )
-
     job.patient_id = patient.id
     job.status = "NEEDS_VERIFICATION"
 
@@ -203,56 +254,107 @@ def extract_report(
     }
 
 
-@router.delete(
-    "/{job_id}",
-    status_code=status.HTTP_200_OK,
-)
-def delete_ingestion_job(
+@router.post("/{job_id}/verify")
+def verify_ingestion_job(
     job_id: int,
+    payload: schemas.VerificationPayload,
     db: Session = Depends(get_db),
+    current_user=Depends(require_technician),
 ):
-    # STAGING ONLY:
-    # Authentication/tenant context will replace this hardcoded value.
-    centre_id = 9901
+    """Cross the authoritative verification boundary.
 
+    The OCR/extracted snapshot is retained unchanged. Technician edits are
+    stored separately in verified_data and only this verified snapshot is
+    allowed to feed downstream report generation.
+    """
     job = (
         db.query(ReportIngestionJob)
         .filter(
             ReportIngestionJob.id == job_id,
-            ReportIngestionJob.centre_id == centre_id,
+            ReportIngestionJob.centre_id == current_user.centre_id,
         )
         .first()
     )
 
     if not job:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found or unauthorized",
-        )
+        raise HTTPException(status_code=404, detail="Ingestion job not found")
 
-    if job.status not in [
-        "PHOTO_UPLOADED",
-        "NEEDS_VERIFICATION",
-    ]:
+    if job.status != "NEEDS_VERIFICATION":
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Cannot delete job after authoritative "
-                "verification boundary"
-            ),
+            detail=f"Job must be in NEEDS_VERIFICATION state; current state is {job.status}",
         )
 
-    # Clean up physical source image.
-    if (
-        job.source_image_path
-        and os.path.exists(job.source_image_path)
-    ):
+    patient = (
+        db.query(Patient)
+        .filter(
+            Patient.id == payload.patient_id,
+            Patient.centre_id == current_user.centre_id,
+        )
+        .first()
+    )
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found for this centre")
+
+    # Do not allow a second authoritative write to replace verified data.
+    if job.verified_data is not None or job.verified_at is not None or job.verified_by is not None:
+        raise HTTPException(status_code=409, detail="Verification has already been recorded")
+
+    verified_payload = payload.model_dump()
+    job.verified_data = json.dumps(
+        verified_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    job.patient_id = patient.id
+    job.verified_at = datetime.utcnow()
+    job.verified_by = current_user.id
+    job.status = "VERIFIED"
+
+    db.commit()
+    db.refresh(job)
+
+    return {
+        "job_id": job.id,
+        "id": job.id,
+        "status": job.status,
+        "patient_id": job.patient_id,
+        "verified_by": job.verified_by,
+        "verified_at": job.verified_at,
+        "verified_data": verified_payload,
+    }
+
+
+@router.delete("/{job_id}", status_code=status.HTTP_200_OK)
+def delete_ingestion_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_technician),
+):
+    job = (
+        db.query(ReportIngestionJob)
+        .filter(
+            ReportIngestionJob.id == job_id,
+            ReportIngestionJob.centre_id == current_user.centre_id,
+        )
+        .first()
+    )
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or unauthorized")
+
+    if job.status not in ["PHOTO_UPLOADED", "NEEDS_VERIFICATION"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete job after authoritative verification boundary",
+        )
+
+    if job.source_image_path and os.path.exists(job.source_image_path):
         try:
             os.remove(job.source_image_path)
-        except Exception:
+        except OSError:
             pass
 
-    # Clean up provisional patient created solely for this job.
     provisional_patient = (
         db.query(Patient)
         .filter(
@@ -269,8 +371,5 @@ def delete_ingestion_job(
     db.commit()
 
     return {
-        "message": (
-            f"Ingestion job {job_id} and provisional "
-            "artifacts successfully deleted."
-        )
+        "message": f"Ingestion job {job_id} and provisional artifacts successfully deleted."
     }
