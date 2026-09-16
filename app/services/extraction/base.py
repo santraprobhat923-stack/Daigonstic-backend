@@ -16,6 +16,8 @@ class ExtractedPatient(BaseModel):
     patient_name: DemographicField = Field(default_factory=DemographicField)
     age: NumericDemographicField = Field(default_factory=NumericDemographicField)
     gender: DemographicField = Field(default_factory=DemographicField)
+    phone: DemographicField = Field(default_factory=DemographicField)
+    email: DemographicField = Field(default_factory=DemographicField)
 
 class ExtractedParameter(BaseModel):
     name: str = Field(..., min_length=1)
