@@ -7,7 +7,8 @@ import json
 
 from app.database import get_db
 from app.models import ReportIngestionJob, Patient
-from app.services.extraction.mock_provider import MockExtractionProvider
+from app.services.extraction import get_extraction_provider
+from app.services.extraction.base import ExtractionProcessingError
 from app.services.patient_matching.service import resolve_or_provision_patient
 
 
@@ -126,22 +127,46 @@ def extract_report(
     # --------------------------------------------------------
     # 1. Execute extraction against THIS job's source image.
     # --------------------------------------------------------
-    extractor = MockExtractionProvider()
+    extractor = get_extraction_provider()
 
-    extraction_result = extractor.extract(
-        job.source_image_path
-    )
+    try:
+        extraction_result = extractor.extract(
+            image_path=job.source_image_path,
+            context={
+                "centre_id": centre_id,
+                "job_id": job.id,
+            },
+        )
+    except ExtractionProcessingError as exc:
+        job.status = "EXTRACTION_FAILED"
+        job.last_error = json.dumps(
+            {
+                "code": exc.code,
+                "message": exc.message,
+            },
+            ensure_ascii=False,
+        )
+        job.attempt_count = (job.attempt_count or 0) + 1
+        db.commit()
 
-    if not isinstance(extraction_result, dict):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": exc.code,
+                "message": exc.message,
+            },
+        ) from exc
+
+    if extraction_result is None:
         raise HTTPException(
             status_code=500,
-            detail="Extraction provider returned invalid data",
+            detail="Extraction provider returned no result",
         )
 
     # --------------------------------------------------------
     # 2. Resolve or provision the patient.
     # --------------------------------------------------------
-    patient_payload = extraction_result.get("patient", {})
+    patient_payload = extraction_result.patient.model_dump()
 
     patient = resolve_or_provision_patient(
         db=db,
@@ -157,7 +182,7 @@ def extract_report(
     # therefore serialize the provider result explicitly.
     # --------------------------------------------------------
     job.extracted_data = json.dumps(
-        extraction_result,
+        extraction_result.model_dump(),
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -174,7 +199,7 @@ def extract_report(
         "status": job.status,
         "matched_patient_id": patient.id,
         "patient_status": patient.status,
-        "extracted_data": extraction_result,
+        "extracted_data": extraction_result.model_dump(),
     }
 
 
