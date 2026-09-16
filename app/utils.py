@@ -1,11 +1,17 @@
 from datetime import datetime, timedelta
+import os
 import bcrypt
 import jwt
 
-# Secret key used to digitally sign tokens (in production, store this in an environment variable)
-SECRET_KEY = "super-secret-diagnostic-key-change-this-in-production"
+# JWT signing configuration. A development fallback keeps the local prototype
+# runnable, while deployments can provide a strong secret through the
+# DIAGNOSTIC_JWT_SECRET environment variable.
+SECRET_KEY = os.getenv(
+    "DIAGNOSTIC_JWT_SECRET",
+    "dev-only-change-this-diagnostic-jwt-secret",
+)
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # Valid for 24 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 
 def hash_password(password: str) -> str:
@@ -28,5 +34,4 @@ def create_access_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
