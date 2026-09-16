@@ -60,6 +60,33 @@ def upload_photo(file: UploadFile = File(...), db: Session = Depends(get_db), cu
     return {"job_id": job.id, "id": job.id, "status": job.status, "original_filename": job.original_filename,
             "filename": job.original_filename, "file_size": job.file_size, "file_hash": job.source_image_hash, "duplicate": False}
 
+@router.get("/queue")
+def get_verification_queue(db: Session = Depends(get_db), current_user=Depends(require_technician)):
+    """Return this technician centre's pending verification jobs from the server database."""
+    jobs = db.query(ReportIngestionJob).filter(
+        ReportIngestionJob.centre_id == current_user.centre_id,
+        ReportIngestionJob.status == "NEEDS_VERIFICATION",
+    ).order_by(ReportIngestionJob.id.desc()).all()
+
+    def parse_json(value):
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    return [{"job_id": job.id, "id": job.id, "status": job.status,
+             "centre_id": job.centre_id, "technician_id": job.technician_id,
+             "patient_id": job.patient_id, "original_filename": job.original_filename,
+             "mime_type": job.mime_type, "file_size": job.file_size,
+             "file_hash": job.source_image_hash,
+             "extracted_data": parse_json(job.extracted_data),
+             "verified_data": parse_json(job.verified_data),
+             "verified_at": job.verified_at, "verified_by": job.verified_by,
+             "final_report_id": job.final_report_id,
+             "last_error": parse_json(job.last_error)} for job in jobs]
+
 @router.get("/{job_id}")
 def get_ingestion_job(job_id: int, db: Session = Depends(get_db), current_user=Depends(require_technician)):
     job = db.query(ReportIngestionJob).filter(ReportIngestionJob.id == job_id,
@@ -118,8 +145,6 @@ def verify_ingestion_job(job_id: int, payload: schemas.VerificationPayload,
     if job.verified_data is not None or job.verified_at is not None or job.verified_by is not None:
         raise HTTPException(status_code=409, detail="Verification has already been recorded")
 
-    # Patient demographics are editable during verification. The original OCR
-    # snapshot remains untouched; only the authoritative patient record changes.
     patient_changes = {
         "name": payload.patient_name,
         "age": payload.patient_age,
