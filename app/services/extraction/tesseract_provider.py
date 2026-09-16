@@ -1,8 +1,8 @@
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 import re
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 
 from app.services.extraction.base import (
@@ -22,10 +22,10 @@ class TesseractExtractionProvider(ExtractionProvider):
     REAL OCR PROVIDER
 
     Pipeline:
-    image -> Tesseract OCR -> deterministic structured parsing
+    image -> multiple OCR/pre-processing passes -> deterministic structured parsing
 
-    Medical values are never invented. Only values explicitly present
-    in the OCR text are structured.
+    Medical values are never invented or silently corrected. The technician
+    verification step remains authoritative.
     """
 
     @property
@@ -45,10 +45,6 @@ class TesseractExtractionProvider(ExtractionProvider):
         age = None
         gender = None
 
-        # Patient ID: supports clean and legacy OCR variants such as:
-        # "Patient ID: P-101"
-        # "PatientID: P-102 Name: Prya Das"
-        # "PatientI[: P-101 Name: ahul Sharma"
         id_match = re.search(
             r"Patient\s*I[Dd\[\:]*\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]*)",
             text,
@@ -57,21 +53,14 @@ class TesseractExtractionProvider(ExtractionProvider):
         if id_match:
             patient_code = id_match.group(1).strip(" .,:;")
 
-        # Patient name can appear on the same line as the ID,
-        # e.g. "PatientID: P-102 Name: Prya Das" or
-        # "PatientI[: P-101 Name: ahul Sharma".
-        # Parse the explicit Name: token independently of the corrupted ID text.
         name_match = re.search(
-            r"\bName\s*[:\-]\s*(.+?)(?=\s+(?:Age|#ge|Gender|Ref|Test|TESTNAME)\b|$)",
+            r"\bName\s*[:\-]\s*(.+?)(?=\s+(?:Age|#ge|Gender|Sex|Ref|Test|TESTNAME)\b|$)",
             text,
             re.IGNORECASE,
         )
-
         if name_match:
             patient_name = name_match.group(1).strip(" .:-")
 
-        # Clean format:
-        # "Age/Sex: 29 Y / Female"
         age_sex_match = re.search(
             r"Age\s*/\s*Sex\s*[:\-]\s*(\d{1,3})\s*Y?\s*/\s*([A-Za-z]+)",
             text,
@@ -81,9 +70,6 @@ class TesseractExtractionProvider(ExtractionProvider):
             age = int(age_sex_match.group(1))
             gender = self._normalize_gender(age_sex_match.group(2))
 
-        # Legacy OCR:
-        # "#ge:28 Gender F"
-        # "#ge: 40 Gender M"
         if age is None:
             legacy_age_match = re.search(
                 r"#ge\s*[:\-]?\s*(\d{1,3})",
@@ -101,7 +87,6 @@ class TesseractExtractionProvider(ExtractionProvider):
         if gender_match:
             gender = self._normalize_gender(gender_match.group(1))
 
-        # Final fallback for a clean standalone Age field.
         if age is None:
             age_match = re.search(
                 r"\bAge\s*[:\-]?\s*(\d{1,3})",
@@ -112,22 +97,10 @@ class TesseractExtractionProvider(ExtractionProvider):
                 age = int(age_match.group(1))
 
         return ExtractedPatient(
-            patient_code=DemographicField(
-                value=patient_code,
-                confidence=0.90 if patient_code else None,
-            ),
-            patient_name=DemographicField(
-                value=patient_name,
-                confidence=0.90 if patient_name else None,
-            ),
-            age=NumericDemographicField(
-                value=age,
-                confidence=0.85 if age is not None else None,
-            ),
-            gender=DemographicField(
-                value=gender,
-                confidence=0.90 if gender else None,
-            ),
+            patient_code=DemographicField(value=patient_code, confidence=0.90 if patient_code else None),
+            patient_name=DemographicField(value=patient_name, confidence=0.90 if patient_name else None),
+            age=NumericDemographicField(value=age, confidence=0.85 if age is not None else None),
+            gender=DemographicField(value=gender, confidence=0.90 if gender else None),
         )
 
     @staticmethod
@@ -139,6 +112,59 @@ class TesseractExtractionProvider(ExtractionProvider):
             return "Female"
         return value
 
+    @staticmethod
+    def _ocr_score(text: str) -> int:
+        """Prefer OCR passes that preserve report structure, not merely more text."""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return -10_000
+
+        score = min(len(lines), 40)
+        for line in lines:
+            if re.search(r"\b(?:Test|TESTNAME|RESULT|UNIT|Age|Gender|Sex|Name|Patient)\b", line, re.IGNORECASE):
+                score += 3
+            if re.search(r"[A-Za-z][A-Za-z /_-]{2,}\s*:\s*[+-]?\d", line):
+                score += 4
+            if re.search(r"[+-]?\d+(?:[.,]\d+)?\s+[A-Za-zµμ/%^0-9._-]+", line):
+                score += 2
+        return score
+
+    def _run_ocr_passes(self, image: Image.Image) -> str:
+        """
+        Run several conservative preprocessing/PSM combinations.
+
+        Analyzer printouts photographed by Android phones often contain faint
+        thermal-printer text, skew, or uneven lighting. A single --psm 6 pass
+        is unnecessarily fragile. We select the OCR text with the strongest
+        report structure and never fabricate a medical value.
+        """
+        gray = ImageOps.grayscale(image)
+        variants = [
+            gray,
+            ImageOps.autocontrast(gray),
+            ImageOps.autocontrast(gray).filter(ImageFilter.SHARPEN),
+        ]
+
+        # A 2x version helps small analyzer characters without changing the
+        # source image stored on disk.
+        enlarged = gray.resize((gray.width * 2, gray.height * 2))
+        variants.append(ImageOps.autocontrast(enlarged))
+
+        candidates = []
+        for variant in variants:
+            for psm in (6, 4, 11):
+                try:
+                    text = pytesseract.image_to_string(variant, config=f"--psm {psm}").strip()
+                except Exception:
+                    continue
+                if text:
+                    candidates.append(text)
+
+        if not candidates:
+            return ""
+
+        return max(candidates, key=self._ocr_score)
+
     def _parse_panel(self, text: str) -> ExtractedPanel:
         lines = [
             re.sub(r"\s+", " ", line).strip()
@@ -147,9 +173,6 @@ class TesseractExtractionProvider(ExtractionProvider):
         ]
 
         panel_name = "Unclassified Panel"
-
-        # Preferred structured report format:
-        # Test: Complete Blood Count (CBC)
         for line in lines:
             match = re.match(r"Test\s*:\s*(.+)$", line, re.IGNORECASE)
             if match:
@@ -184,34 +207,25 @@ class TesseractExtractionProvider(ExtractionProvider):
 
         parameters: List[ExtractedParameter] = []
 
-        # Parse one parameter per line.
         for line in lines:
             if re.search(r"TESTNAME\s+RESULT\s+UNIT", line, re.IGNORECASE):
                 continue
 
-            if re.search(
-                r"^(?:Status|Sttus|Date|Patient|Name|Age|Gender|Ref)\b",
-                line,
-                re.IGNORECASE,
-            ):
+            if re.search(r"^(?:Status|Sttus|Date|Patient|Name|Age|Gender|Sex|Ref)\b", line, re.IGNORECASE):
                 continue
 
-            # Legacy demographic/reference metadata can appear on one line:
-            # "#ge:28 Gender F Ref LFT-2028:02"
             if re.search(r"#ge\s*[:\-]?\s*\d+", line, re.IGNORECASE):
                 continue
 
-            if re.search(r"\bGender\s*[:\-]?\s*[MF]\b", line, re.IGNORECASE):
+            if re.search(r"\b(?:Gender|Sex)\s*[:\-]?\s*[MF]\b", line, re.IGNORECASE):
                 continue
 
             if re.search(r"\bRef\s+[A-Za-z0-9._/-]+", line, re.IGNORECASE):
                 continue
 
-            # Clean format:
-            # "TSH: 2.45 ulU/mL (Ref: 0.27 - 4.20)"
             match = re.match(
                 r"^(.+?)\s*:\s*"
-                r"([+-]?\d+(?:\.\d+)?)\s*"
+                r"([+-]?\d+(?:[.,]\d+)?)\s*"
                 r"([A-Za-zµμ/%^0-9._-]+)?"
                 r"(?:\s*\(Ref:\s*(.*?)\))?$",
                 line,
@@ -219,13 +233,9 @@ class TesseractExtractionProvider(ExtractionProvider):
             )
 
             if not match:
-                # Legacy/table format:
-                # "Hemogobin 145 gL"
-                # "WECCount 7800 cellsmeL."
-                # "RECCount 51 milloniul"
                 match = re.match(
                     r"^(.+?)\s+"
-                    r"([+-]?\d+(?:\.\d+)?)\s+"
+                    r"([+-]?\d+(?:[.,]\d+)?)\s+"
                     r"([A-Za-zµμ/%^0-9._-]+)\s*$",
                     line,
                     re.IGNORECASE,
@@ -235,22 +245,14 @@ class TesseractExtractionProvider(ExtractionProvider):
                 continue
 
             raw_name = match.group(1).strip()
-            result = match.group(2).strip()
+            result = match.group(2).strip().replace(",", ".")
             unit = match.group(3).strip() if match.group(3) else None
             reference_range = match.group(4).strip() if len(match.groups()) >= 4 and match.group(4) else None
 
             normalized_key = re.sub(r"\s+", " ", raw_name).strip().lower()
             normalized_name = aliases.get(normalized_key, raw_name)
 
-            # Avoid accidentally treating metadata as a lab parameter.
-            if normalized_name.lower() in {
-                "patient id",
-                "patient name",
-                "age",
-                "gender",
-                "test",
-                "status",
-            }:
+            if normalized_name.lower() in {"patient id", "patient name", "age", "gender", "sex", "test", "status"}:
                 continue
 
             parameters.append(
@@ -263,53 +265,28 @@ class TesseractExtractionProvider(ExtractionProvider):
                 )
             )
 
-        return ExtractedPanel(
-            panel_name=panel_name,
-            parameters=parameters,
-        )
+        return ExtractedPanel(panel_name=panel_name, parameters=parameters)
 
-    def extract(
-        self,
-        image_path: Path,
-        context: Dict[str, Any],
-    ) -> ExtractionResult:
+    def extract(self, image_path: Path, context: Dict[str, Any]) -> ExtractionResult:
         image_path = Path(image_path)
 
         if not image_path.exists():
-            raise ExtractionProcessingError(
-                "IMAGE_NOT_FOUND",
-                f"OCR source image does not exist: {image_path}",
-            )
+            raise ExtractionProcessingError("IMAGE_NOT_FOUND", f"OCR source image does not exist: {image_path}")
 
         try:
             image = Image.open(image_path)
             image.load()
         except Exception as exc:
-            raise ExtractionProcessingError(
-                "IMAGE_OPEN_FAILED",
-                f"Unable to open OCR source image: {exc}",
-            ) from exc
+            raise ExtractionProcessingError("IMAGE_OPEN_FAILED", f"Unable to open OCR source image: {exc}") from exc
 
         try:
-            image = ImageOps.grayscale(image)
-
-            raw_text = pytesseract.image_to_string(
-                image,
-                config="--psm 6",
-            )
+            raw_text = self._run_ocr_passes(image)
         except Exception as exc:
-            raise ExtractionProcessingError(
-                "OCR_FAILED",
-                f"Tesseract OCR failed: {exc}",
-            ) from exc
+            raise ExtractionProcessingError("OCR_FAILED", f"Tesseract OCR failed: {exc}") from exc
 
         raw_text = raw_text.strip()
-
         if not raw_text:
-            raise ExtractionProcessingError(
-                "OCR_EMPTY",
-                "Tesseract returned no readable text from the image.",
-            )
+            raise ExtractionProcessingError("OCR_EMPTY", "Tesseract returned no readable text from the image.")
 
         patient = self._parse_patient(raw_text)
         panels = [self._parse_panel(raw_text)]
