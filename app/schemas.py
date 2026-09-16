@@ -203,7 +203,10 @@ class VerificationPayload(BaseModel):
     patient_age: Optional[int] = Field(default=None, ge=0, le=150)
     patient_gender: Optional[str] = None
     patient_phone: Optional[str] = None
-    patient_email: Optional[EmailStr] = None
+    # Verification is a technician review step, so an empty/legacy/non-standard
+    # email must not block locking an otherwise valid report. Patient CRUD keeps
+    # strict EmailStr validation separately.
+    patient_email: Optional[str] = None
     patient_code: Optional[str] = None
     barcode: Optional[str] = None
     panels: List[VerifiedPanel] = Field(..., min_items=1)
