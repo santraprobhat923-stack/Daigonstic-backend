@@ -57,9 +57,18 @@ class PatientBase(BaseModel):
 class PatientCreate(PatientBase):
     pass
 
+class PatientUpdate(BaseModel):
+    full_name: Optional[str] = None
+    age: Optional[int] = Field(default=None, ge=0, le=150)
+    gender: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    patient_code: Optional[str] = None
+
 class PatientResponse(PatientBase):
     id: int
     centre_id: int
+    patient_code: str
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
@@ -209,6 +218,7 @@ class CentreDashboardResponse(BaseModel):
     centre_name: str
     credit_balance: int
     low_credit: bool
+    threshold: int
     total_patients: int
     total_orders: int
     total_reports: int
@@ -230,5 +240,12 @@ class VerifiedPanel(BaseModel):
 
 class VerificationPayload(BaseModel):
     patient_id: int
+    patient_name: Optional[str] = None
+    patient_age: Optional[int] = Field(default=None, ge=0, le=150)
+    patient_gender: Optional[str] = None
+    patient_phone: Optional[str] = None
+    patient_email: Optional[EmailStr] = None
+    patient_code: Optional[str] = None
+    barcode: Optional[str] = None
     panels: List[VerifiedPanel] = Field(..., min_items=1)
     technician_notes: Optional[str] = None
