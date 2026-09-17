@@ -3,13 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
 from app.routers import (
     centres, users, auth, patients, tests, orders, billing, credits, dashboard,
-    report_ingest, reports_final
+    report_ingest, reports_final, workflow
 )
 
 app = FastAPI(
     title="Diagnostic Centre Automated Ingestion Backend",
-    version="3.1.0",
-    description="Automated diagnostic report ingestion, provisional patient provisioning, and verification pipeline."
+    version="3.2.0",
+    description="Centre-scoped analyzer image ingestion, technician verification, PDF generation, payment and optional WhatsApp workflow."
 )
 
 app.add_middleware(
@@ -20,7 +20,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active Architecture Routers Only
 app.include_router(auth.router)
 app.include_router(centres.router)
 app.include_router(users.router)
@@ -32,12 +31,14 @@ app.include_router(credits.router)
 app.include_router(dashboard.router)
 app.include_router(report_ingest.router)
 app.include_router(reports_final.router)
+app.include_router(workflow.router)
 
 @app.get("/")
 def read_root():
     return {
         "status": "online",
         "system": "Diagnostic Centre Automated Ingestion Pipeline",
-        "version": "3.1.0",
+        "version": "3.2.0",
+        "workflow": "photo -> OCR -> technician verification -> PDF credit -> payment -> optional WhatsApp",
         "docs": "/docs"
     }
