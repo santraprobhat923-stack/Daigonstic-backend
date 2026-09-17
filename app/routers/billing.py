@@ -7,14 +7,9 @@ from sqlalchemy.orm import Session
 from app import models, schemas, oauth2
 from app.database import get_db
 
-router = APIRouter(
-    prefix="/billing",
-    tags=["Billing & Payments"]
-)
-
+router = APIRouter(prefix="/billing", tags=["Billing & Payments"])
 BILL_STORAGE_DIR = "storage/bills"
 os.makedirs(BILL_STORAGE_DIR, exist_ok=True)
-
 
 @router.post("/", response_model=schemas.BillingResponse, status_code=status.HTTP_201_CREATED)
 def record_billing(
@@ -25,57 +20,81 @@ def record_billing(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(oauth2.require_technician)
 ):
-    # Enforce payment status validation rules
     if payment_status == models.PaymentStatusEnum.paid and pending_amount != 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="When payment status is 'paid', pending_amount must be 0."
-        )
-    if payment_status in [models.PaymentStatusEnum.partially_paid, models.PaymentStatusEnum.pending] and pending_amount <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"When payment status is '{payment_status.value}', pending_amount must be > 0."
-        )
+        raise HTTPException(status_code=400, detail="When payment status is 'paid', pending_amount must be 0.")
+    if payment_status == models.PaymentStatusEnum.pending and pending_amount <= 0:
+        raise HTTPException(status_code=400, detail="When payment status is 'pending', pending_amount must be > 0.")
 
-    # Tenant check: Order must belong to current centre
-    order = db.query(models.Order).filter(
-        models.Order.id == order_id,
-        models.Order.centre_id == current_user.centre_id
-    ).first()
-
+    order = db.query(models.Order).filter(models.Order.id == order_id, models.Order.centre_id == current_user.centre_id).first()
     if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Order {order_id} not found in this centre."
-        )
-
-    # Check for existing billing
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found in this centre.")
     if db.query(models.Billing).filter(models.Billing.order_id == order_id).first():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Billing record already exists for order {order_id}."
-        )
+        raise HTTPException(status_code=400, detail=f"Billing record already exists for order {order_id}.")
 
-    # Optional Bill Document handling
     saved_file_path = None
     if bill_file and bill_file.filename:
         tenant_dir = os.path.join(BILL_STORAGE_DIR, str(current_user.centre_id))
         os.makedirs(tenant_dir, exist_ok=True)
-        safe_filename = f"bill_order_{order_id}_{bill_file.filename}"
+        safe_filename = f"bill_order_{order_id}_{os.path.basename(bill_file.filename)}"
         saved_file_path = os.path.join(tenant_dir, safe_filename)
         with open(saved_file_path, "wb") as buffer:
             shutil.copyfileobj(bill_file.file, buffer)
 
+    total_amount = float(order.total_amount or 0)
+    paid_amount = max(0.0, total_amount - float(pending_amount))
     billing = models.Billing(
         order_id=order.id,
         patient_id=order.patient_id,
         centre_id=current_user.centre_id,
-        total_amount=order.total_amount,
-        payment_status=payment_status,
+        total_amount=total_amount,
+        paid_amount=paid_amount,
         pending_amount=pending_amount,
+        payment_status=payment_status,
         bill_file_path=saved_file_path
     )
     db.add(billing)
     db.commit()
     db.refresh(billing)
+    return billing
+
+@router.put("/{order_id}/payment", response_model=schemas.BillingResponse)
+def update_payment_status(
+    order_id: int,
+    payment_status: models.PaymentStatusEnum = Form(...),
+    pending_amount: int = Form(0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(oauth2.require_technician)
+):
+    """Manual payment verification for the prototype; release remains separately gated."""
+    if payment_status == models.PaymentStatusEnum.paid and pending_amount != 0:
+        raise HTTPException(status_code=400, detail="Paid payment must have pending_amount=0")
+    if payment_status == models.PaymentStatusEnum.pending and pending_amount <= 0:
+        raise HTTPException(status_code=400, detail="Pending payment must have pending_amount>0")
+
+    billing = db.query(models.Billing).filter(
+        models.Billing.order_id == order_id,
+        models.Billing.centre_id == current_user.centre_id
+    ).first()
+    if not billing:
+        raise HTTPException(status_code=404, detail="Billing record not found for this order")
+
+    billing.payment_status = payment_status
+    billing.pending_amount = float(pending_amount)
+    billing.paid_amount = max(0.0, float(billing.total_amount or 0) - float(pending_amount))
+    db.commit()
+    db.refresh(billing)
+    return billing
+
+@router.get("/order/{order_id}", response_model=schemas.BillingResponse)
+def get_order_billing(
+    order_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(oauth2.get_current_user)
+):
+    billing = db.query(models.Billing).filter(
+        models.Billing.order_id == order_id,
+        models.Billing.centre_id == current_user.centre_id
+    ).first()
+    if not billing:
+        raise HTTPException(status_code=404, detail="Billing record not found for this order")
     return billing
