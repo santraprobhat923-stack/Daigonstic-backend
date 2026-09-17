@@ -22,7 +22,7 @@ class TesseractExtractionProvider(ExtractionProvider):
     REAL OCR PROVIDER
 
     Pipeline:
-    image -> multiple OCR/pre-processing passes -> deterministic structured parsing
+    image -> conservative OCR/pre-processing passes -> deterministic structured parsing
 
     Medical values are never invented or silently corrected. The technician
     verification step remains authoritative.
@@ -114,7 +114,7 @@ class TesseractExtractionProvider(ExtractionProvider):
 
     @staticmethod
     def _ocr_score(text: str) -> int:
-        """Prefer OCR passes that preserve report structure, not merely more text."""
+        """Prefer OCR passes that preserve both report headers and result rows."""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if not lines:
             return -10_000
@@ -123,36 +123,29 @@ class TesseractExtractionProvider(ExtractionProvider):
         for line in lines:
             if re.search(r"\b(?:Test|TESTNAME|RESULT|UNIT|Age|Gender|Sex|Name|Patient)\b", line, re.IGNORECASE):
                 score += 3
-            if re.search(r"[A-Za-z][A-Za-z /_-]{2,}\s*:\s*[+-]?\d", line):
-                score += 4
+            # Analyzer rows frequently arrive as either:
+            #   Hemoglobin: 14.0 g/dL
+            #   Hemoglobin 14.0 g/dL
+            #   Hemoglobin 14.0
+            if re.search(r"[A-Za-z][A-Za-z /_()\-]{2,}\s*:?\s*[+-]?\d+(?:[.,]\d+)?", line):
+                score += 5
             if re.search(r"[+-]?\d+(?:[.,]\d+)?\s+[A-Za-zµμ/%^0-9._-]+", line):
                 score += 2
         return score
 
     def _run_ocr_passes(self, image: Image.Image) -> str:
-        """
-        Run several conservative preprocessing/PSM combinations.
-
-        Analyzer printouts photographed by Android phones often contain faint
-        thermal-printer text, skew, or uneven lighting. A single --psm 6 pass
-        is unnecessarily fragile. We select the OCR text with the strongest
-        report structure and never fabricate a medical value.
-        """
+        """Run a small set of useful OCR passes and choose the structurally richest result."""
         gray = ImageOps.grayscale(image)
         variants = [
             gray,
             ImageOps.autocontrast(gray),
             ImageOps.autocontrast(gray).filter(ImageFilter.SHARPEN),
+            ImageOps.autocontrast(gray.resize((gray.width * 2, gray.height * 2))),
         ]
-
-        # A 2x version helps small analyzer characters without changing the
-        # source image stored on disk.
-        enlarged = gray.resize((gray.width * 2, gray.height * 2))
-        variants.append(ImageOps.autocontrast(enlarged))
 
         candidates = []
         for variant in variants:
-            for psm in (6, 4, 11):
+            for psm in (6, 11):
                 try:
                     text = pytesseract.image_to_string(variant, config=f"--psm {psm}").strip()
                 except Exception:
@@ -162,7 +155,6 @@ class TesseractExtractionProvider(ExtractionProvider):
 
         if not candidates:
             return ""
-
         return max(candidates, key=self._ocr_score)
 
     def _parse_panel(self, text: str) -> ExtractedPanel:
@@ -184,11 +176,14 @@ class TesseractExtractionProvider(ExtractionProvider):
             "hemoglobin": "Hemoglobin",
             "weccount": "WBC Count",
             "wbc count": "WBC Count",
+            "wbc": "WBC Count",
             "plteletcount": "Platelet Count",
             "plateletcount": "Platelet Count",
+            "platelets": "Platelet Count",
             "rccount": "RBC Count",
             "rbccount": "RBC Count",
             "reccount": "RBC Count",
+            "rbc": "RBC Count",
             "bilrubin tolal": "Bilirubin Total",
             "bilirubin tolal": "Bilirubin Total",
             "bilirubin ol": "Bilirubin Total",
@@ -223,6 +218,7 @@ class TesseractExtractionProvider(ExtractionProvider):
             if re.search(r"\bRef\s+[A-Za-z0-9._/-]+", line, re.IGNORECASE):
                 continue
 
+            # Preferred formats with a colon and optional unit/reference range.
             match = re.match(
                 r"^(.+?)\s*:\s*"
                 r"([+-]?\d+(?:[.,]\d+)?)\s*"
@@ -232,6 +228,7 @@ class TesseractExtractionProvider(ExtractionProvider):
                 re.IGNORECASE,
             )
 
+            # Common analyzer tabular format: NAME RESULT UNIT.
             if not match:
                 match = re.match(
                     r"^(.+?)\s+"
@@ -241,10 +238,19 @@ class TesseractExtractionProvider(ExtractionProvider):
                     re.IGNORECASE,
                 )
 
+            # Some thermal slips omit the unit entirely.
+            if not match:
+                match = re.match(
+                    r"^([A-Za-z][A-Za-z0-9 /_()\-]{2,}?)\s*[:\-]?\s*"
+                    r"([+-]?\d+(?:[.,]\d+)?)\s*$",
+                    line,
+                    re.IGNORECASE,
+                )
+
             if not match:
                 continue
 
-            raw_name = match.group(1).strip()
+            raw_name = match.group(1).strip(" .:-")
             result = match.group(2).strip().replace(",", ".")
             unit = match.group(3).strip() if match.group(3) else None
             reference_range = match.group(4).strip() if len(match.groups()) >= 4 and match.group(4) else None
