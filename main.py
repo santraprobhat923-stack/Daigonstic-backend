@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
 from app.routers import (
-    centres, users, auth, patients, tests, orders, billing, credits, dashboard, report_ingest
+    centres, users, auth, patients, tests, orders, billing, credits, dashboard,
+    report_ingest, reports_final
 )
 
 app = FastAPI(
@@ -30,6 +31,7 @@ app.include_router(billing.router)
 app.include_router(credits.router)
 app.include_router(dashboard.router)
 app.include_router(report_ingest.router)
+app.include_router(reports_final.router)
 
 @app.get("/")
 def read_root():
