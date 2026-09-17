@@ -10,12 +10,23 @@ from app.models import ReportIngestionJob, Patient, Centre, ReportDocument, Repo
 from app.oauth2 import require_technician
 from app import schemas
 from app.services.extraction import get_extraction_provider
-from app.services.extraction.base import ExtractionProcessingError
+from app.services.extraction.base import ExtractionProcessingError, ExtractionResult, ExtractedPatient
 from app.services.patient_matching.service import resolve_or_provision_patient
 from app.services.pdf_compiler import compile_and_save_report
 
 router = APIRouter(prefix="/reports/ingest", tags=["Report Ingestion"])
 STORAGE_DIR = "storage/source_images"
+
+
+def _empty_extraction(provider_name="tesseract", provider_version="fault-tolerant"):
+    return ExtractionResult(
+        patient=ExtractedPatient(),
+        panels=[],
+        provider_name=provider_name,
+        provider_version=provider_version,
+        raw_text_summary="OCR returned no structured fields. Technician verification can be completed manually.",
+    )
+
 
 @router.post("/photo", status_code=status.HTTP_201_CREATED)
 def upload_photo(file: UploadFile = File(...), db: Session = Depends(get_db), current_user=Depends(require_technician)):
@@ -61,9 +72,9 @@ def upload_photo(file: UploadFile = File(...), db: Session = Depends(get_db), cu
     return {"job_id": job.id, "id": job.id, "status": job.status, "original_filename": job.original_filename,
             "filename": job.original_filename, "file_size": job.file_size, "file_hash": job.source_image_hash, "duplicate": False}
 
+
 @router.get("/queue")
 def get_verification_queue(db: Session = Depends(get_db), current_user=Depends(require_technician)):
-    """Return this technician centre's pending verification jobs from the server database."""
     jobs = db.query(ReportIngestionJob).filter(
         ReportIngestionJob.centre_id == current_user.centre_id,
         ReportIngestionJob.status == "NEEDS_VERIFICATION",
@@ -88,6 +99,7 @@ def get_verification_queue(db: Session = Depends(get_db), current_user=Depends(r
              "final_report_id": job.final_report_id,
              "last_error": parse_json(job.last_error)} for job in jobs]
 
+
 @router.get("/{job_id}")
 def get_ingestion_job(job_id: int, db: Session = Depends(get_db), current_user=Depends(require_technician)):
     job = db.query(ReportIngestionJob).filter(ReportIngestionJob.id == job_id,
@@ -104,6 +116,7 @@ def get_ingestion_job(job_id: int, db: Session = Depends(get_db), current_user=D
             "verified_data": parse_json(job.verified_data), "verified_at": job.verified_at,
             "verified_by": job.verified_by, "final_report_id": job.final_report_id, "last_error": parse_json(job.last_error)}
 
+
 @router.post("/{job_id}/extract")
 def extract_report(job_id: int, db: Session = Depends(get_db), current_user=Depends(require_technician)):
     centre_id = current_user.centre_id
@@ -113,28 +126,42 @@ def extract_report(job_id: int, db: Session = Depends(get_db), current_user=Depe
     if not job.source_image_path: raise HTTPException(status_code=400, detail="Ingestion job has no source image")
     if not os.path.exists(job.source_image_path): raise HTTPException(status_code=404, detail="Source image file not found")
     if job.status == "VERIFIED": raise HTTPException(status_code=400, detail="Cannot extract an already verified ingestion job")
+
     extractor = get_extraction_provider()
+    ocr_warning = None
     try:
         extraction_result = extractor.extract(image_path=job.source_image_path, context={"centre_id": centre_id, "job_id": job.id})
     except ExtractionProcessingError as exc:
-        job.status = "EXTRACTION_FAILED"
-        job.last_error = json.dumps({"code": exc.code, "message": exc.message}, ensure_ascii=False)
-        job.attempt_count = (job.attempt_count or 0) + 1; db.commit()
-        raise HTTPException(status_code=422, detail={"code": exc.code, "message": exc.message}) from exc
-    if extraction_result is None: raise HTTPException(status_code=500, detail="Extraction provider returned no result")
+        # OCR is assistive, never a hard workflow boundary. Keep the job open for
+        # technician entry even when Tesseract cannot produce structured output.
+        extraction_result = _empty_extraction(getattr(extractor, "provider_name", "tesseract"), getattr(extractor, "provider_version", "fault-tolerant"))
+        ocr_warning = {"code": exc.code, "message": exc.message}
+        job.attempt_count = (job.attempt_count or 0) + 1
+        job.last_error = json.dumps(ocr_warning, ensure_ascii=False)
+
+    if extraction_result is None:
+        extraction_result = _empty_extraction()
+        ocr_warning = {"code": "EMPTY_RESULT", "message": "OCR returned no structured result"}
+
     patient_payload = extraction_result.patient.model_dump()
     patient = resolve_or_provision_patient(db=db, centre_id=centre_id,
         extracted_patient_data=patient_payload, ingestion_job_id=job.id)
     job.extracted_data = json.dumps(extraction_result.model_dump(), ensure_ascii=False, separators=(",", ":"))
-    job.patient_id = patient.id; job.status = "NEEDS_VERIFICATION"
+    job.patient_id = patient.id
+    job.status = "NEEDS_VERIFICATION"
+    # A warning is informational; it must not prevent verification.
+    if ocr_warning:
+        job.last_error = json.dumps(ocr_warning, ensure_ascii=False)
+    else:
+        job.last_error = None
     db.commit(); db.refresh(job)
     return {"job_id": job.id, "id": job.id, "status": job.status, "matched_patient_id": patient.id,
-            "patient_status": patient.status, "extracted_data": extraction_result.model_dump()}
+            "patient_status": patient.status, "extracted_data": extraction_result.model_dump(), "ocr_warning": ocr_warning}
+
 
 @router.post("/{job_id}/verify")
 def verify_ingestion_job(job_id: int, payload: schemas.VerificationPayload,
     db: Session = Depends(get_db), current_user=Depends(require_technician)):
-    """Store an authoritative technician snapshot after editable patient and result review."""
     job = db.query(ReportIngestionJob).filter(ReportIngestionJob.id == job_id,
         ReportIngestionJob.centre_id == current_user.centre_id).first()
     if not job: raise HTTPException(status_code=404, detail="Ingestion job not found")
@@ -151,7 +178,7 @@ def verify_ingestion_job(job_id: int, payload: schemas.VerificationPayload,
         "age": payload.patient_age,
         "gender": payload.patient_gender,
         "phone": payload.patient_phone,
-        "email": str(payload.patient_email) if payload.patient_email is not None else None,
+        "email": payload.patient_email,
     }
     for field, value in patient_changes.items():
         if value is not None:
@@ -169,15 +196,15 @@ def verify_ingestion_job(job_id: int, payload: schemas.VerificationPayload,
     return {"job_id": job.id, "id": job.id, "status": job.status, "patient_id": job.patient_id,
             "verified_by": job.verified_by, "verified_at": job.verified_at, "verified_data": verified_payload}
 
+
 @router.post("/{job_id}/finalize")
 def finalize_verified_report(job_id: int, db: Session = Depends(get_db), current_user=Depends(require_technician)):
-    """Compile the immutable technician-verified snapshot into an authoritative PDF held for payment release."""
+    """Generate the paid-by-credit PDF. Patient payment/WhatsApp happens only afterwards."""
     job = db.query(ReportIngestionJob).filter(
         ReportIngestionJob.id == job_id,
         ReportIngestionJob.centre_id == current_user.centre_id,
     ).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Ingestion job not found")
+    if not job: raise HTTPException(status_code=404, detail="Ingestion job not found")
 
     if job.final_report_id:
         existing = db.query(ReportDocument).filter(
@@ -185,35 +212,29 @@ def finalize_verified_report(job_id: int, db: Session = Depends(get_db), current
             ReportDocument.centre_id == current_user.centre_id,
         ).first()
         if existing:
-            return {
-                "job_id": job.id,
-                "report_id": existing.id,
-                "status": job.status,
-                "release_status": existing.release_status,
-                "file_path": existing.pdf_path or existing.file_path,
-                "filename": existing.pdf_filename or existing.original_filename,
-                "file_size": existing.pdf_size or existing.file_size,
-                "file_hash": existing.pdf_hash or existing.file_hash,
-                "idempotent": True,
-            }
+            return {"job_id": job.id, "report_id": existing.id, "status": job.status,
+                    "release_status": existing.release_status, "file_path": existing.pdf_path or existing.file_path,
+                    "filename": existing.pdf_filename or existing.original_filename,
+                    "file_size": existing.pdf_size or existing.file_size,
+                    "file_hash": existing.pdf_hash or existing.file_hash, "idempotent": True}
 
     if job.status != "VERIFIED":
         raise HTTPException(status_code=400, detail=f"Job must be VERIFIED before PDF generation; current state is {job.status}")
-    if not job.verified_data:
-        raise HTTPException(status_code=400, detail="Verified data is missing; PDF cannot be generated")
-    if not job.patient_id:
-        raise HTTPException(status_code=400, detail="Patient linkage is missing; PDF cannot be generated")
+    if not job.verified_data: raise HTTPException(status_code=400, detail="Verified data is missing; PDF cannot be generated")
+    if not job.patient_id: raise HTTPException(status_code=400, detail="Patient linkage is missing; PDF cannot be generated")
 
-    patient = db.query(Patient).filter(
-        Patient.id == job.patient_id,
-        Patient.centre_id == current_user.centre_id,
-    ).first()
-    if not patient:
-        raise HTTPException(status_code=404, detail="Verified patient not found")
+    patient = db.query(Patient).filter(Patient.id == job.patient_id, Patient.centre_id == current_user.centre_id).first()
+    if not patient: raise HTTPException(status_code=404, detail="Verified patient not found")
     centre = db.query(Centre).filter(Centre.id == current_user.centre_id).first()
-    if not centre:
-        raise HTTPException(status_code=404, detail="Diagnostic centre not found")
+    if not centre: raise HTTPException(status_code=404, detail="Diagnostic centre not found")
 
+    from app.services import credit_service
+    # One report = one credit. Credit is consumed only when the authoritative PDF is generated.
+    credit_service.deduct_credit_locked(
+        db=db, centre_id=current_user.centre_id, amount=1, user_id=current_user.id,
+        reference_type="report_pdf", reference_id=job.id,
+        description="One credit consumed for authoritative PDF generation"
+    )
     try:
         verified_data = json.loads(job.verified_data)
         compiled = compile_and_save_report(
@@ -223,55 +244,28 @@ def finalize_verified_report(job_id: int, db: Session = Depends(get_db), current
             patient_code=patient.patient_code,
             verified_data=verified_data,
         )
-
         report = ReportDocument(
-            centre_id=current_user.centre_id,
-            patient_code=patient.patient_code,
-            patient_id=patient.id,
-            uploaded_by=current_user.id,
-            file_path=compiled["file_path"],
-            original_filename=compiled["filename"],
-            stored_filename=compiled["filename"],
-            file_size=compiled["file_size"],
-            file_hash=compiled["file_hash"],
-            file_checksum=compiled["file_hash"],
-            identification_method="technician_verified_ingestion",
-            storage_status=ReportStorageStatusEnum.stored,
-            created_at=datetime.utcnow(),
-            release_status="HELD_PAYMENT",
-            is_released=False,
-            pdf_path=compiled["file_path"],
-            pdf_filename=compiled["filename"],
-            pdf_hash=compiled["file_hash"],
-            pdf_size=compiled["file_size"],
-            ingestion_job_id=job.id,
-            verified_at=job.verified_at,
-            verified_by=job.verified_by,
+            centre_id=current_user.centre_id, patient_code=patient.patient_code, patient_id=patient.id,
+            uploaded_by=current_user.id, file_path=compiled["file_path"], original_filename=compiled["filename"],
+            stored_filename=compiled["filename"], file_size=compiled["file_size"], file_hash=compiled["file_hash"],
+            file_checksum=compiled["file_hash"], identification_method="technician_verified_ingestion",
+            storage_status=ReportStorageStatusEnum.stored, created_at=datetime.utcnow(),
+            release_status="HELD_PAYMENT", is_released=False, pdf_path=compiled["file_path"],
+            pdf_filename=compiled["filename"], pdf_hash=compiled["file_hash"], pdf_size=compiled["file_size"],
+            ingestion_job_id=job.id, verified_at=job.verified_at, verified_by=job.verified_by,
         )
-        db.add(report)
-        db.flush()
-        job.final_report_id = report.id
-        job.status = "HELD_PAYMENT"
-        job.completed_at = datetime.utcnow()
-        db.commit()
-        db.refresh(report)
-        db.refresh(job)
-        return {
-            "job_id": job.id,
-            "report_id": report.id,
-            "status": job.status,
-            "release_status": report.release_status,
-            "file_path": report.pdf_path,
-            "filename": report.pdf_filename,
-            "file_size": report.pdf_size,
-            "file_hash": report.pdf_hash,
-            "idempotent": False,
-        }
+        db.add(report); db.flush(); job.final_report_id = report.id; job.status = "HELD_PAYMENT"; job.completed_at = datetime.utcnow()
+        db.commit(); db.refresh(report); db.refresh(job)
+        return {"job_id": job.id, "report_id": report.id, "status": job.status,
+                "release_status": report.release_status, "file_path": report.pdf_path, "filename": report.pdf_filename,
+                "file_size": report.pdf_size, "file_hash": report.pdf_hash, "idempotent": False,
+                "credits_consumed": 1}
     except HTTPException:
-        raise
+        db.rollback(); raise
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}") from exc
+
 
 @router.delete("/{job_id}", status_code=status.HTTP_200_OK)
 def delete_ingestion_job(job_id: int, db: Session = Depends(get_db), current_user=Depends(require_technician)):
