@@ -190,24 +190,25 @@ class CentreDashboardResponse(BaseModel):
     total_pending_amount: float
 
 class VerifiedParameter(BaseModel):
+    # OCR is only a draft. A technician may correct, add, or leave a field blank
+    # while completing a report manually.
     name: str = Field(..., min_length=1)
-    result: str = Field(..., min_length=1)
+    result: str = Field(default="")
     unit: Optional[str] = None
     reference_range: Optional[str] = None
 class VerifiedPanel(BaseModel):
     panel_name: str = Field(..., min_length=1)
-    parameters: List[VerifiedParameter] = Field(..., min_items=1)
+    parameters: List[VerifiedParameter] = Field(default_factory=list)
 class VerificationPayload(BaseModel):
     patient_id: int
     patient_name: Optional[str] = None
     patient_age: Optional[int] = Field(default=None, ge=0, le=150)
     patient_gender: Optional[str] = None
     patient_phone: Optional[str] = None
-    # Verification is a technician review step, so an empty/legacy/non-standard
-    # email must not block locking an otherwise valid report. Patient CRUD keeps
-    # strict EmailStr validation separately.
     patient_email: Optional[str] = None
     patient_code: Optional[str] = None
     barcode: Optional[str] = None
+    # At least one panel is required, but its rows may be empty so the UI can
+    # start from a completely failed/partial OCR result and let the technician add rows.
     panels: List[VerifiedPanel] = Field(..., min_items=1)
     technician_notes: Optional[str] = None
