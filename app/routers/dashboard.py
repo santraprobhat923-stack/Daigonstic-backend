@@ -7,10 +7,7 @@ from app import models, schemas, oauth2
 from app.database import get_db
 from app.services import credit_service
 
-router = APIRouter(
-    prefix="/dashboard",
-    tags=["Centre Dashboard"]
-)
+router = APIRouter(prefix="/dashboard", tags=["Centre Dashboard"])
 
 @router.get("", response_model=schemas.CentreDashboardResponse)
 def get_centre_dashboard(
@@ -18,7 +15,6 @@ def get_centre_dashboard(
     current_user: models.User = Depends(oauth2.get_current_user)
 ):
     centre_id = current_user.centre_id
-
     centre = db.query(models.Centre).filter(models.Centre.id == centre_id).first()
     credit_account = credit_service.get_or_create_account(db, centre_id)
 
@@ -43,9 +39,10 @@ def get_centre_dashboard(
         models.Billing.payment_status == models.PaymentStatusEnum.pending
     ).scalar() or 0
 
+    # Keep compatibility with the current enum while still exposing the dashboard field.
     partially_paid_count = db.query(func.count(models.Billing.id)).filter(
         models.Billing.centre_id == centre_id,
-        models.Billing.payment_status == models.PaymentStatusEnum.partially_paid
+        models.Billing.payment_status == "PARTIALLY_PAID"
     ).scalar() or 0
 
     total_pending_amount = db.query(func.sum(models.Billing.pending_amount)).filter(
