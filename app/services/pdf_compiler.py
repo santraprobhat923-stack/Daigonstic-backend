@@ -190,24 +190,48 @@ def _fill_acroform(template_reader, fields, tests):
 
 
 def _extract_label_positions(page):
-    """Find visible text labels and their coordinates on a PDF template."""
-    positions = {}
+    """Find labels and the actual blank/value coordinate on the same PDF row."""
+    tokens = []
 
     def visitor_text(text, cm, tm, font_dict, font_size):
         clean = " ".join(str(text or "").split()).strip()
         if not clean:
             return
-        x = float(tm[4])
-        y = float(tm[5])
-        key = _field_key(clean.rstrip(":"))
-        positions.setdefault(key, (x, y, clean))
+        tokens.append({"text": clean, "x": float(tm[4]), "y": float(tm[5])})
 
     try:
         page.extract_text(visitor_text=visitor_text)
     except Exception:
-        return positions
-    return positions
+        return {}
 
+    positions = {}
+    for token in tokens:
+        raw = token["text"]
+        label = raw.rstrip(":").strip()
+        key = _field_key(label)
+        if not key or key in {
+            "patient_details", "test_results", "test", "result",
+            "unit", "reference_range"
+        }:
+            continue
+
+        # Use the template's real underscore/value column rather than
+        # estimating a position from the label width.
+        candidates = [
+            t for t in tokens
+            if t["x"] > token["x"] + 2
+            and abs(t["y"] - token["y"]) <= 2
+            and set(t["text"].replace(" ", "")) <= {"_"}
+            and len(t["text"].replace(" ", "")) >= 3
+        ]
+        value_x = (
+            candidates[0]["x"]
+            if candidates
+            else token["x"] + max(20, len(label) * 4.5)
+        )
+        positions.setdefault(key, (value_x, token["y"], label))
+
+    return positions
 
 def _pdf_text_overlay(page_width, page_height, fields, tests, label_positions, notes):
     """Create a transparent PDF page that writes verified values onto the centre template."""
@@ -226,9 +250,7 @@ def _pdf_text_overlay(page_width, page_height, fields, tests, label_positions, n
             continue
         pos = label_positions.get(key)
         if pos:
-            label = pos[2]
-            label_width = max(20, len(label) * 4.8)
-            add_text(pos[0] + label_width + 6, pos[1], value, 9)
+            add_text(pos[0], pos[1], value, 9)
 
     # Test rows: first use matching searchable test labels. This makes common
     # centre templates work without hard-coded coordinates.
@@ -240,7 +262,7 @@ def _pdf_text_overlay(page_width, page_height, fields, tests, label_positions, n
             result = " ".join(x for x in [test["result"], test["unit"]] if x)
             if test["reference"]:
                 result += f"  ({test['reference']})"
-            add_text(pos[0] + max(30, len(pos[2]) * 4.8) + 6, pos[1], result, 9)
+            add_text(pos[0], pos[1], result, 9)
         else:
             unmatched.append(test)
 
