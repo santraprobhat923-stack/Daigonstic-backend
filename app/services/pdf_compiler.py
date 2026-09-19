@@ -269,22 +269,46 @@ def _pdf_text_overlay(page_width, page_height, fields, tests, label_positions, n
         if pos:
             add_text(pos[0], pos[1], value, 9)
 
-    # Test rows: first use matching searchable test labels. This makes common
-    # centre templates work without hard-coded coordinates.
-    unmatched = []
+    # Test rows: match the verified test name to the searchable label
+    # printed on the uploaded centre template. We intentionally use fuzzy
+    # matching here because real templates commonly use labels such as
+    # "Hb / Hemoglobin", "WBC Count", "Platelet Count", etc.
+    def normalise_test_name(value):
+        return "".join(ch.lower() for ch in _safe_text(value) if ch.isalnum())
+
+    template_test_labels = {}
+    for label_key, pos in label_positions.items():
+        template_test_labels[normalise_test_name(pos[2])] = pos
+
     for test in tests:
-        key = _field_key(test["name"])
-        pos = label_positions.get(key)
+        test_norm = normalise_test_name(test["name"])
+        pos = label_positions.get(_field_key(test["name"]))
+
+        if not pos and test_norm:
+            # Exact normalised label match first.
+            pos = template_test_labels.get(test_norm)
+
+        if not pos and test_norm:
+            # Then allow one label to contain the other. This handles common
+            # variants such as "WBC" vs "WBC Count" without hard-coded tests.
+            for label_norm, candidate in template_test_labels.items():
+                if (test_norm in label_norm or label_norm in test_norm) and min(len(test_norm), len(label_norm)) >= 3:
+                    pos = candidate
+                    break
+
         if pos:
             result = " ".join(x for x in [test["result"], test["unit"]] if x)
-            if test["reference"]:
-                result += f"  ({test['reference']})"
             add_text(pos[0], pos[1], result, 9)
-        else:
-            unmatched.append(test)
 
-    # Never draw a second report block over a centre's template.
-    # Unmatched custom fields remain untouched until the centre maps them.
+            # Reference ranges are normally printed in their own column.
+            # If the template exposes a searchable "reference/range" label
+            # on the same row, it can be populated separately below.
+        else:
+            # Do not invent coordinates for an unknown test row. The uploaded
+            # template remains the visual source of truth.
+            continue
+
+    # Never draw a second generic report block over the centre's template.
 
     if notes:
         add_text(40, 32, f"Technician Notes: {notes}", 8)
