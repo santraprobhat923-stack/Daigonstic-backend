@@ -124,22 +124,63 @@ class TesseractExtractionProvider(ExtractionProvider):
         if not candidates:
             raise ExtractionProcessingError("OCR_EMPTY", "Tesseract returned no readable text from the image.")
 
-        # Do NOT concatenate all OCR passes. Different preprocessing/PSM passes
-        # can read the same number differently (for example 88 -> 8 or 8.8).
-        # Instead, select one strong candidate and let _parse_panel deduplicate
-        # rows within that candidate. Keeping the passes separate prevents one
-        # physical result from becoming multiple database rows.
-        ranked = sorted(candidates, key=self._ocr_score, reverse=True)
+        # OCR passes are alternatives, not rows to concatenate. Different
+        # preprocessing/PSM passes can read the same printed number differently
+        # (for example 88 -> 8 or 8.8). Build a consensus per test name first.
+        parsed = []
+        for candidate in candidates:
+            panel = self._parse_panel(candidate)
+            score = self._ocr_score(candidate)
+            parsed.append((candidate, panel, score))
+
+        def key_for(name: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+        # Count exact readings for each normalized test name.
+        votes: Dict[str, Dict[str, int]] = {}
+        for _, panel, _ in parsed:
+            for param in panel.parameters:
+                k = key_for(param.name)
+                result = param.result.strip()
+                votes.setdefault(k, {})
+                votes[k][result] = votes[k].get(result, 0) + 1
+
+        # When OCR differs only by a missing decimal point (e.g. 56 vs 5.6),
+        # prefer the decimal form only when that exact form was independently
+        # observed in another OCR pass. We never manufacture a value.
+        for k, readings in list(votes.items()):
+            for raw in list(readings):
+                if re.fullmatch(r"[+-]?\\d{2,}", raw):
+                    digits = raw.lstrip("+-")
+                    sign = raw[:1] if raw[:1] in "+-" else ""
+                    for pos in range(1, len(digits)):
+                        decimal = sign + digits[:pos] + "." + digits[pos:]
+                        if decimal in readings:
+                            readings[decimal] += readings[raw]
+
+        consensus: Dict[str, str] = {}
+        for k, readings in votes.items():
+            consensus[k] = max(readings.items(), key=lambda item: item[1])[0]
+
+        # Choose one real OCR candidate that agrees with the largest number of
+        # consensus readings. This keeps raw_text_summary tied to an actual OCR
+        # pass instead of synthesizing text that was never produced by Tesseract.
+        ranked = sorted(parsed, key=lambda item: item[2], reverse=True)
         best = ranked[0]
-        best_count = len(self._parse_panel(best).parameters)
+        best_match = -1
+        best_count = -1
+        for item in ranked:
+            candidate, panel, score = item
+            matches = sum(
+                1 for p in panel.parameters
+                if consensus.get(key_for(p.name)) == p.result.strip()
+            )
+            count = len(panel.parameters)
+            if (matches, count, score) > (best_match, best_count, best[2]):
+                best = item
+                best_match, best_count = matches, count
 
-        for candidate in ranked[1:]:
-            count = len(self._parse_panel(candidate).parameters)
-            if count > best_count:
-                best = candidate
-                best_count = count
-
-        return best
+        return best[0]
 
     def _parse_panel(self, text: str) -> ExtractedPanel:
         lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
