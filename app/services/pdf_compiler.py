@@ -356,14 +356,44 @@ def _apply_template(template_path: str, generated_bytes: bytes, patient_name: st
         writer = PdfWriter()
 
         # Work on a cloned reader so the stored centre template is never modified.
+        # IMPORTANT: a template may contain patient labels but no mapped test-result
+        # fields. In that case the old code returned the template alone, silently
+        # dropping the verified test results. For safety, fall back to the generated
+        # authoritative report unless at least one test can actually be rendered.
         form_filled = _fill_acroform(template_reader, fields, tests)
+
+        first_page = template_reader.pages[0]
+        labels = _extract_label_positions(first_page)
+
+        matched_test_count = 0
+        for test in tests:
+            key = _field_key(test["name"])
+            if key in labels:
+                matched_test_count += 1
+
+        acro_test_mapped = False
+        try:
+            root = template_reader.trailer["/Root"].get_object()
+            acro = root.get("/AcroForm")
+            if acro:
+                form = acro.get_object()
+                for field in form.get("/Fields", []):
+                    name = str(field.get_object().get("/T") or "")
+                    if name.startswith("test_"):
+                        acro_test_mapped = True
+                        break
+        except Exception:
+            acro_test_mapped = False
+
+        if tests and not matched_test_count and not acro_test_mapped:
+            # Do not produce a PDF that looks valid but contains no test results.
+            return generated_bytes
 
         for page_index, template_page in enumerate(template_reader.pages):
             width = float(template_page.mediabox.width)
             height = float(template_page.mediabox.height)
 
             if page_index == 0 and not form_filled:
-                labels = _extract_label_positions(template_page)
                 overlay = _pdf_text_overlay(width, height, fields, tests, labels, notes)
                 if overlay:
                     overlay_page = PdfReader(BytesIO(overlay)).pages[0]
