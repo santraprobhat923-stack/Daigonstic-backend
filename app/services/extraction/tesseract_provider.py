@@ -96,8 +96,7 @@ class TesseractExtractionProvider(ExtractionProvider):
         return score
 
     def _run_ocr_passes(self, image: Image.Image) -> str:
-        """Run OCR variants, then merge useful lines so one weak OCR pass cannot hide test rows."""
-        # Very large Android camera images make OCR unnecessarily slow.
+        """Run several OCR passes for cross-checking, without duplicating conflicting rows."""
         max_dimension = 2400
         if max(image.size) > max_dimension:
             scale = max_dimension / max(image.size)
@@ -125,31 +124,21 @@ class TesseractExtractionProvider(ExtractionProvider):
         if not candidates:
             raise ExtractionProcessingError("OCR_EMPTY", "Tesseract returned no readable text from the image.")
 
-        # Prefer a candidate that actually contains structured result rows.
+        # Do NOT concatenate all OCR passes. Different preprocessing/PSM passes
+        # can read the same number differently (for example 88 -> 8 or 8.8).
+        # Instead, select one strong candidate and let _parse_panel deduplicate
+        # rows within that candidate. Keeping the passes separate prevents one
+        # physical result from becoming multiple database rows.
         ranked = sorted(candidates, key=self._ocr_score, reverse=True)
         best = ranked[0]
         best_count = len(self._parse_panel(best).parameters)
+
         for candidate in ranked[1:]:
             count = len(self._parse_panel(candidate).parameters)
             if count > best_count:
                 best = candidate
                 best_count = count
 
-        # Merge lines from the strongest candidates. This is important for slips
-        # where PSM 6 sees the patient header while PSM 11 sees the analyzer rows.
-        merged: List[str] = []
-        seen = set()
-        for candidate in ranked[:4]:
-            for line in candidate.splitlines():
-                line = re.sub(r"\s+", " ", line).strip()
-                key = line.lower()
-                if line and key not in seen:
-                    seen.add(key)
-                    merged.append(line)
-
-        merged_text = "\n".join(merged)
-        if len(self._parse_panel(merged_text).parameters) >= best_count:
-            return merged_text
         return best
 
     def _parse_panel(self, text: str) -> ExtractedPanel:
