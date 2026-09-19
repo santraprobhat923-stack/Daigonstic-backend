@@ -87,9 +87,19 @@ def _safe_text(value) -> str:
 def _flatten_verified_fields(patient_name: str, patient_code: str, verified_data: dict):
     """Return the verified values that are allowed to reach the final PDF."""
     fields = {
-        "patient_name": _safe_text(patient_name),
-        "patient_id": _safe_text(patient_code),
-        "patient_code": _safe_text(patient_code),
+        "patient_name": _safe_text(verified_data.get("patient_name")) or _safe_text(patient_name),
+        "patient_id": _safe_text(verified_data.get("patient_code")) or _safe_text(patient_code),
+        "patient_code": _safe_text(verified_data.get("patient_code")) or _safe_text(patient_code),
+        "age_gender": " / ".join(
+            x for x in [
+                _safe_text(verified_data.get("patient_age")),
+                _safe_text(verified_data.get("patient_gender")),
+            ] if x
+        ),
+        "age": _safe_text(verified_data.get("patient_age")),
+        "gender": _safe_text(verified_data.get("patient_gender")),
+        "phone": _safe_text(verified_data.get("patient_phone")),
+        "email": _safe_text(verified_data.get("patient_email")),
         "date": datetime.utcnow().strftime("%d-%m-%Y"),
         "status": "Verified & Certified",
     }
@@ -129,6 +139,13 @@ def _field_key(label: str) -> str:
         "uhid": "patient_id",
         "date": "date",
         "report_date": "date",
+        "age_gender": "age_gender",
+        "age": "age",
+        "gender": "gender",
+        "phone": "phone",
+        "mobile": "phone",
+        "phone_number": "phone",
+        "email": "email",
         "status": "status",
     }
     return aliases.get(key, key)
@@ -266,20 +283,8 @@ def _pdf_text_overlay(page_width, page_height, fields, tests, label_positions, n
         else:
             unmatched.append(test)
 
-    # For blank/scanned templates that do not expose searchable test labels,
-    # use a clean results block in the lower half rather than replacing the
-    # uploaded design. This keeps the centre's template as the actual report.
-    if unmatched:
-        y = max(90, page_height - 360)
-        add_text(40, y + 24, "TEST RESULTS", 10)
-        for test in unmatched:
-            value = " ".join(x for x in [test["result"], test["unit"]] if x)
-            if test["reference"]:
-                value += f"  ({test['reference']})"
-            add_text(40, y, f"{test['name']}: {value}", 8.5)
-            y -= 16
-            if y < 40:
-                break
+    # Never draw a second report block over a centre's template.
+    # Unmatched custom fields remain untouched until the centre maps them.
 
     if notes:
         add_text(40, 32, f"Technician Notes: {notes}", 8)
